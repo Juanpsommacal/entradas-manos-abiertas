@@ -146,6 +146,7 @@ input[type="text"] {
 .result.warn { background: var(--warn); }
 .result.bad { background: var(--bad); }
 .result.draw { background: var(--teal); }
+.result.notice { background: var(--navy-deep); }
 .result .prize { font-size: 1.4rem; font-weight: 600; }
 
 .reset { display: flex; flex-direction: column; align-items: center; gap: 10px; padding-top: 8px; }
@@ -10283,6 +10284,7 @@ const EVENT = {
 };
 const SELLERS = { C: "Carolina", M: "Marina" };
 const PREFIX = "MA26"; // marca que identifica los QR de este festival
+const VERSION = "5"; // se muestra en el inicio para confirmar que el celular tiene la última versión
 
 const logoImg = new Image();
 logoImg.src = LOGO;
@@ -10308,7 +10310,9 @@ const state = {
   draw: null,       // sorteo en pantalla: {rolling:true} o el ganador
   doorSell: false,  // formulario de venta en puerta abierto
   doorTicket: null, // entrada vendida en puerta, en pantalla
+  doorNotice: false, // aviso de "no apagues la pantalla" al entrar a la puerta
 };
+state.doorNotice = state.role === "door";
 
 const $app = document.getElementById("app");
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -10322,7 +10326,12 @@ const icons = {
   door: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3M21 14v.01M14 21h3M21 18v3h-3"/></svg>',
 };
 
-function setRole(role) { state.role = role; save("ma.role", role); state.ticket = null; state.confirmReset = false; render(); }
+function setRole(role) {
+  state.role = role; save("ma.role", role);
+  state.ticket = null; state.confirmReset = false;
+  state.doorNotice = role === "door";
+  render();
+}
 
 function renderReset(what) {
   if (!state.confirmReset) return `
@@ -10566,8 +10575,9 @@ function entries() { return load("ma.door", {}); }
 
 function registerScan(text) {
   const t = parsePayload(text);
-  if (!t) { state.doorResult = { kind: "bad" }; render(); return; }
+  if (!t) { state.doorResult = { kind: "bad", raw: text }; render(); return; }
   admit(t);
+  if (state.doorResult) state.doorResult.raw = text;
 }
 function admit(t) {
   const all = entries();
@@ -10596,6 +10606,21 @@ function decodeFromSource(src, w, h) {
   return null;
 }
 
+// Cámara en vivo: una sola lectura chica por cuadro. Si no encuentra el QR, en un cuarto de segundo viene otro cuadro.
+const liveCanvas = document.createElement("canvas");
+function decodeLive(v) {
+  const w = v.videoWidth, h = v.videoHeight;
+  if (!w || !h) return null;
+  const k = Math.min(1, 640 / Math.max(w, h));
+  const cw = Math.round(w * k), ch = Math.round(h * k);
+  if (liveCanvas.width !== cw) liveCanvas.width = cw;
+  if (liveCanvas.height !== ch) liveCanvas.height = ch;
+  const x = liveCanvas.getContext("2d", { willReadFrequently: true });
+  x.drawImage(v, 0, 0, cw, ch);
+  const res = jsQR(x.getImageData(0, 0, cw, ch).data, cw, ch, { inversionAttempts: "dontInvert" });
+  return res && res.data ? res.data : null;
+}
+
 async function onPhoto(file) {
   if (!file) return;
   const msg = document.getElementById("doorMsg");
@@ -10610,15 +10635,31 @@ async function onPhoto(file) {
   }
 }
 
-async function startLive() {
-  if (!canLive || liveFailed) return false;
-  try {
-    if (!liveStream) liveStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
-    return true;
-  } catch { liveFailed = true; liveStream = null; return false; }
+// Un solo lector de cámara a la vez: cada vez que arranca uno nuevo, el anterior se frena solo.
+// Lo escaneado no vive en el lector sino en el guardado del teléfono, así que frenarlo no borra nada.
+let loopId = 0, livePromise = null, camLost = false;
+// El último QR mostrado se ignora mientras siga a la vista y hasta 3 segundos después.
+const IGNORE_MS = 3000;
+let ignoreText = null, ignoreSeen = 0;
+
+const streamAlive = () => !!liveStream && liveStream.getVideoTracks().some(t => t.readyState === "live");
+const doorBusy = () => state.doorNotice || state.doorResult || state.draw || state.doorTicket || state.doorSell;
+
+function startLive() {
+  if (!canLive || liveFailed) return Promise.resolve(false);
+  if (streamAlive()) return Promise.resolve(true);
+  if (liveStream) stopLive();
+  if (!livePromise) {
+    livePromise = navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false })
+      .then(s => { liveStream = s; camLost = false; return true; })
+      .catch(() => { liveFailed = true; liveStream = null; return false; })
+      .finally(() => { livePromise = null; });
+  }
+  return livePromise;
 }
 function stopLive() {
   scanning = false;
+  loopId++;
   if (liveStream) { liveStream.getTracks().forEach(t => t.stop()); liveStream = null; }
 }
 function attachLive() {
@@ -10627,18 +10668,39 @@ function attachLive() {
   v.srcObject = liveStream;
   v.play().catch(() => {});
   scanning = true;
+  const id = ++loopId;
   let last = 0;
   const loop = now => {
-    if (!scanning || state.doorResult || state.draw || state.doorTicket || state.role !== "door") return;
+    if (id !== loopId || !scanning || doorBusy() || state.role !== "door") return;
     if (now - last > 220 && v.readyState >= 2) {
       last = now;
-      const text = decodeFromSource(v, v.videoWidth, v.videoHeight);
-      if (text) { registerScan(text); return; }
+      const text = decodeLive(v);
+      if (text && text === ignoreText && Date.now() - ignoreSeen < IGNORE_MS) {
+        ignoreSeen = Date.now();
+      } else if (text) {
+        registerScan(text);
+        return;
+      }
     }
     requestAnimationFrame(loop);
   };
   requestAnimationFrame(loop);
 }
+
+// Que la pantalla no se apague sola en modo puerta (si el celular lo permite)
+let wakeLock = null;
+async function keepAwake() {
+  if (state.role !== "door" || document.visibilityState !== "visible" || wakeLock) return;
+  try { wakeLock = await navigator.wakeLock.request("screen"); wakeLock.addEventListener("release", () => { wakeLock = null; }); } catch {}
+}
+function releaseAwake() { try { wakeLock && wakeLock.release(); } catch {} wakeLock = null; }
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible" || state.role !== "door") return;
+  keepAwake();
+  // al volver de pantalla apagada, el sistema suele cortar la cámara: la reconectamos
+  if (liveStream && !streamAlive()) { stopLive(); camLost = true; render(); }
+});
 
 function normalizeCode(s) {
   const m = String(s).toUpperCase().replace(/\s/g, "").match(/^([A-Z])-?(\d{1,4})$/);
@@ -10686,6 +10748,11 @@ function renderDoor() {
     : `
       <label class="btn coral" for="photo">${icons.camera}<span>Escanear entrada<span class="sub">Sacale una foto al QR</span></span></label>
       <p class="hint" id="doorMsg">Tocá el botón, sacale una foto al QR que te muestra el invitado y confirmá la foto.</p>`}
+    ${camLost && !live ? `
+      <div class="confirm">
+        <p><b>La cámara se cortó.</b> Recargá la página para volver a usarla. No se pierde nada de lo escaneado.</p>
+        <button class="btn" data-act="reload">Recargar página</button>
+      </div>` : ""}
     ${!storageOk ? `<p class="err">Este teléfono no deja guardar datos: no cierres esta página durante el evento.</p>` : ""}
     <details>
       <summary class="muted" style="cursor:pointer;padding-block:8px">¿No se lee el QR? Escribí el número</summary>
@@ -10721,6 +10788,16 @@ function renderDoor() {
       : `<p class="muted">Cuando escanees la primera entrada aparece acá, con la hora en que entró.</p>`}
     </section>
     ${renderReset("Se borran todos los ingresos y los ganadores del sorteo. Usalo solo después de probar, antes de que empiece el evento. La numeración de las ventas en puerta sigue donde estaba, para que no se repita ningún número.")}`;
+}
+
+function renderDoorNotice() {
+  return `
+    <div class="result notice" role="alertdialog" aria-labelledby="noticeTitle">
+      <div class="big" id="noticeTitle">Modo puerta</div>
+      <p class="name">No apagues ni bloquees la pantalla mientras escaneás.</p>
+      <p class="people">Si se apaga y la cámara queda en negro, recargá la página. No se pierde nada: los ingresos y el sorteo quedan guardados en este celular.</p>
+      <button class="btn" data-act="closeNotice">Entendido</button>
+    </div>`;
 }
 
 // ---------- venta en puerta ----------
@@ -10836,20 +10913,26 @@ function renderHome() {
       <button class="btn" data-role="M">${icons.ticket}<span>Marina<span class="sub">Vendo entradas</span></span></button>
       <button class="btn teal" data-role="door">${icons.door}<span>Estoy en la puerta<span class="sub">Escaneo las entradas</span></span></button>
     </div>
-    <p class="muted small" style="text-align:center">El teléfono se acuerda de tu elección. Lo podés cambiar cuando quieras.</p>`;
+    <p class="muted small" style="text-align:center">El teléfono se acuerda de tu elección. Lo podés cambiar cuando quieras.</p>
+    <p class="muted small" style="text-align:center">Versión ${VERSION}</p>`;
 }
 
 async function render() {
   let html;
   if (state.role === "door") {
-    if (!state.doorResult && canLive && !liveFailed && !liveStream) await startLive();
-    html = renderDoor() + (state.doorResult ? renderResult() : state.draw ? renderDraw() : state.doorTicket ? renderDoorTicket() : "");
+    if (!state.doorNotice && !state.doorResult) await startLive();
+    keepAwake();
+    const overlay = state.doorNotice ? renderDoorNotice() : state.doorResult ? renderResult()
+      : state.draw ? renderDraw() : state.doorTicket ? renderDoorTicket() : "";
+    html = renderDoor() + overlay;
   } else {
     stopLive();
+    releaseAwake();
     html = SELLERS[state.role] ? renderSeller() : renderHome();
   }
   $app.innerHTML = `<div class="wrap">${html}</div>`;
-  if (state.role === "door" && !state.doorResult && !state.draw && !state.doorTicket) attachLive();
+  if (state.role === "door" && !doorBusy()) attachLive();
+  else if (state.role === "door") { scanning = false; loopId++; }
 }
 
 // ---------- eventos ----------
@@ -10867,7 +10950,12 @@ $app.addEventListener("click", e => {
   else if (act === "new") { state.ticket = null; render(); }
   else if (act === "edit") { state.editing = true; render(); }
   else if (act === "reopen") showTicket(sold()[Number(el.dataset.i)]);
-  else if (act === "nextGuest") { state.doorResult = null; render(); }
+  else if (act === "nextGuest") {
+    if (state.doorResult && state.doorResult.raw) { ignoreText = state.doorResult.raw; ignoreSeen = Date.now(); }
+    state.doorResult = null; render();
+  }
+  else if (act === "closeNotice") { state.doorNotice = false; render(); }
+  else if (act === "reload") location.reload();
   else if (act === "askReset") { state.confirmReset = true; render(); }
   else if (act === "cancelReset") { state.confirmReset = false; render(); }
   else if (act === "doReset") doReset();
@@ -10875,6 +10963,7 @@ $app.addEventListener("click", e => {
   else if (act === "closeDraw") { state.draw = null; render(); }
   else if (act === "undo") {
     const all = entries(); delete all[el.dataset.code]; save("ma.door", all);
+    if (state.doorResult && state.doorResult.raw) { ignoreText = state.doorResult.raw; ignoreSeen = Date.now(); }
     state.doorResult = null; render();
   }
 });
